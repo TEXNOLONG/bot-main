@@ -2,6 +2,7 @@ import { Telegraf, Markup } from "telegraf";
 import { message } from "telegraf/filters";
 import fs from "fs";
 import path from "path";
+import dns from "dns";
 import { indexFile, loadAllFromIndex, removeFile, getIndexedFiles, isInIndex } from "./local-db/syncer.js";
 import { search, formatResults } from "./local-db/search.js";
 import { getStats } from "./local-db/mem-db.js";
@@ -58,7 +59,7 @@ import {
 } from "./agreements.js";
 import { getCache, setCache, getCacheStats, cleanupCache, clearAllCache } from "./cache.js";
 import { SNOS_METHODS, SNOS_MAP } from "./snos.js";
-import { OSINT_METHODS, OSINT_MAP } from "./osint.js";
+import { OSINT_METHODS, OSINT_MAP, handleDossierDone, runSmartOsint, safeFetch, type DossierEntry, TYPE_CONFIG, buildDossierNavigation } from "./osint.js";
 import { TOOLS, TOOLS_MAP } from "./tools.js";
 import { formatDate, timeLeft } from "./visual.js";
 import { emailStressTest, addEmail, removeEmail, getEmails } from "./emailstress.js";
@@ -351,6 +352,28 @@ export function createBot(token: string): { bot: Telegraf; initDb: () => Promise
     await ctx.reply("✗ Отменено.", backMainKeyboard);
   });
 
+  // ══ /dossier_done — завершить составление досье ══
+  bot.command("dossier_done", async (ctx) => {
+    const state = userStates.get(ctx.from.id);
+    if (!state || state.tab !== "osint" || state.key !== "dossier") {
+      await ctx.reply("📋 Досье не собрано. Начни с /osint → 📋 Составить досье", backMainKeyboard);
+      return;
+    }
+    const done = await handleDossierDone(ctx, state as any);
+    if (done) userStates.delete(ctx.from.id);
+  });
+
+  // ══ /dossier_cancel — отменить составление досье ══
+  bot.command("dossier_cancel", async (ctx) => {
+    const state = userStates.get(ctx.from.id);
+    if (state?.tab === "osint" && state.key === "dossier") {
+      userStates.delete(ctx.from.id);
+      await ctx.reply("❌ Составление досье отменено.", backMainKeyboard);
+    } else {
+      await ctx.reply("❌ Нет активного досье.", backMainKeyboard);
+    }
+  });
+
   // ══ /agreement ══
   bot.command("agreement", async (ctx) => {
     const ag = getUserAgreement(ctx.from.id);
@@ -380,7 +403,7 @@ export function createBot(token: string): { bot: Telegraf; initDb: () => Promise
       `Было записей: <b>${before.total}</b>\n` +
       `Из них просрочено: <b>${before.expired}</b>\n\n` +
       `Все OSINT-данные будут обновлены при следующем запросе.`,
-      { parse_mode: "HTML", ...backMainKeyboard }
+      { parse_mode: "HTML", reply_markup: backMainKeyboard }
     );
   });
 
@@ -403,7 +426,7 @@ export function createBot(token: string): { bot: Telegraf; initDb: () => Promise
       `2. Передай ID администратору\n` +
       `3. Дождись активации и нажми /start\n\n` +
       `<i>Весь контент исключительно визуальный, для демонстраций.</i>`,
-      { parse_mode: "HTML", ...backMainKeyboard }
+      { parse_mode: "HTML", reply_markup: backMainKeyboard }
     );
   });
 
@@ -415,7 +438,7 @@ export function createBot(token: string): { bot: Telegraf; initDb: () => Promise
       "Поисковые запросы и тексты сообщений в журнал не записываются.\n\n" +
       "Публично доступны только проверки инфраструктуры и открытых источников. Чувствительные функции отключены по умолчанию. " +
       "Запросить удаление своих данных можно у администратора.",
-      { parse_mode: "HTML", ...backMainKeyboard },
+      { parse_mode: "HTML", reply_markup: backMainKeyboard },
     );
   });
 
@@ -1006,6 +1029,148 @@ export function createBot(token: string): { bot: Telegraf; initDb: () => Promise
     await editSafe(ctx as any, "◎ <b>Углублённый</b>\n\nВыбери метод:", osintDeepKeyboard);
   });
 
+  bot.action("osint_dossier", async (ctx) => {
+    await ctx.answerCbQuery();
+    if (!checkSub(ctx)) { await ctx.answerCbQuery("[#] Нет подписки!", { show_alert: true }); return; }
+    await editSafe(ctx as any, 
+      `╔══════════════════════════════╗
+` +
+      `║ 📋 <b>СОСТАВЛЕНИЕ ДОСЬЕ</b>        ║
+` +
+      `╚══════════════════════════════╝
+
+` +
+      `Введи данные по очереди:
+
+` +
+      `📧 Email
+📱 Телефон
+👤 Username
+🌐 IP/Домен
+📝 Заметки
+
+` +
+      `Отправь <code>/dossier_done</code> когда закончишь.
+` +
+      `Отправь <code>/dossier_cancel</code> для отмены.`,
+      osintKeyboard
+    );
+    // Store dossier state in userStates (no session middleware in bot)
+    userStates.set(ctx.from.id, { tab: "osint", key: "dossier", step: "input", entries: [] });
+  });
+
+  // ── Smart OSINT callback ──
+  bot.action("osint_smart", async (ctx) => {
+    await ctx.answerCbQuery();
+    if (!checkSub(ctx)) { await ctx.answerCbQuery("[#] Нет подписки!", { show_alert: true }); return; }
+    await editSafe(ctx as any, 
+      `🔍 <b>УМНЫЙ OSINT</b>\n\n` +
+      `Напишите что угодно:\n` +
+      `• email, телефон, username, IP, домен\n` +
+      `• имя, фамилия, ник\n\n` +
+      `Бот сам определит тип и начнёт поиск.`,
+      osintKeyboard
+    );
+    userStates.set(ctx.from.id, { tab: "osint", key: "smart", step: "input" });
+  });
+
+  // ── Dossier navigation callbacks ──
+  bot.action(/dossier_prev_(\d+)/, async (ctx) => {
+    await ctx.answerCbQuery();
+    const state = userStates.get(ctx.from.id);
+    if (!state?.entries || state.entries.length === 0) return;
+    
+    const idx = parseInt(ctx.match[1]) - 1;
+    if (idx < 0 || idx >= state.entries.length) return;
+    
+    const entry = state.entries[idx];
+    const config = TYPE_CONFIG[entry.type];
+    
+    let html = `╔══════════════════════════════════════╗\n`;
+    html += `║ 📂 <b>ПРОФЕССИОНАЛЬНОЕ ДОСЬЕ</b>          ║\n`;
+    html += `╠══════════════════════════════════════╣\n`;
+    html += `║ 📊 Всего: <b>${state.entries.length}</b> записей              ║\n`;
+    html += `╚══════════════════════════════════════╝\n\n`;
+    html += `📍 Объект <b>${idx + 1}/${state.entries.length}</b>\n\n`;
+    html += `┌─ <b>${config.icon} ${config.label}</b> ───────────────────┐\n`;
+    html += `│ 🎯 <code>${entry.value}</code> │\n`;
+    html += `├──────────────────────────────┤\n`;
+    
+    if (entry.results) {
+      const lines = entry.results.split('\n');
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (trimmed) {
+          const clean = trimmed
+            .replace(/┌─|└─|├─|│/g, '')
+            .replace(/^│\s*/, '│ ');
+          html += `${clean}\n`;
+        }
+      }
+    }
+    
+    html += `└──────────────────────────────┘`;
+    
+    await ctx.editMessageText(html, {
+      parse_mode: "HTML",
+      reply_markup: buildDossierNavigation(idx, state.entries.length)
+    });
+  });
+
+  bot.action(/dossier_next_(\d+)/, async (ctx) => {
+    await ctx.answerCbQuery();
+    const state = userStates.get(ctx.from.id);
+    if (!state?.entries || state.entries.length === 0) return;
+    
+    const idx = parseInt(ctx.match[1]) + 1;
+    if (idx < 0 || idx >= state.entries.length) return;
+    
+    const entry = state.entries[idx];
+    const config = TYPE_CONFIG[entry.type];
+    
+    let html = `╔══════════════════════════════════════╗\n`;
+    html += `║ 📂 <b>ПРОФЕССИОНАЛЬНОЕ ДОСЬЕ</b>          ║\n`;
+    html += `╠══════════════════════════════════════╣\n`;
+    html += `║ 📊 Всего: <b>${state.entries.length}</b> записей              ║\n`;
+    html += `╚══════════════════════════════════════╝\n\n`;
+    html += `📍 Объект <b>${idx + 1}/${state.entries.length}</b>\n\n`;
+    html += `┌─ <b>${config.icon} ${config.label}</b> ───────────────────┐\n`;
+    html += `│ 🎯 <code>${entry.value}</code> │\n`;
+    html += `├──────────────────────────────┤\n`;
+    
+    if (entry.results) {
+      const lines = entry.results.split('\n');
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (trimmed) {
+          const clean = trimmed
+            .replace(/┌─|└─|├─|│/g, '')
+            .replace(/^│\s*/, '│ ');
+          html += `${clean}\n`;
+        }
+      }
+    }
+    
+    html += `└──────────────────────────────┘`;
+    
+    await ctx.editMessageText(html, {
+      parse_mode: "HTML",
+      reply_markup: buildDossierNavigation(idx, state.entries.length)
+    });
+  });
+
+  bot.action("dossier_full", async (ctx) => {
+    await ctx.answerCbQuery();
+    const state = userStates.get(ctx.from.id);
+    if (!state?.entries || state.entries.length === 0) return;
+    
+    const html = buildDossierChain(state.entries);
+    await ctx.editMessageText(html, {
+      parse_mode: "HTML",
+      reply_markup: buildDossierNavigation(0, state.entries.length)
+    });
+  });
+
   // ══════════════════════════════════════════════════════════════════════════
   // TAB 3 — ИНСТРУМЕНТЫ
   // ══════════════════════════════════════════════════════════════════════════
@@ -1409,7 +1574,7 @@ export function createBot(token: string): { bot: Telegraf; initDb: () => Promise
     setWelcomeMedia({ fileId, type: "photo" });
     await ctx.reply(`✓ <b>Фото приветствия обновлено!</b>\n\nТеперь оно будет показываться при /start.`, {
       parse_mode: "HTML",
-      ...adminKeyboard,
+      reply_markup: adminKeyboard,
     });
   });
 
@@ -1422,7 +1587,7 @@ export function createBot(token: string): { bot: Telegraf; initDb: () => Promise
     setWelcomeMedia({ fileId, type: "animation" });
     await ctx.reply(`✓ <b>GIF приветствия обновлён!</b>\n\nТеперь он будет показываться при /start.`, {
       parse_mode: "HTML",
-      ...adminKeyboard,
+      reply_markup: adminKeyboard,
     });
   });
 
@@ -1433,7 +1598,123 @@ export function createBot(token: string): { bot: Telegraf; initDb: () => Promise
   bot.on(message("text"), async (ctx) => {
     const { id, username, first_name } = ctx.from;
     trackUser(id, username, first_name);
+    
+    // ─ Dossier mode (stored in userStates, not ctx.session) ─
     const state = userStates.get(id);
+    if (state?.tab === "osint" && state.key === "dossier") {
+      const text = ctx.message?.text?.trim() || '';
+      if (text === '/dossier_done') {
+        const done = await handleDossierDone(ctx, state as any);
+        if (done) return;
+        return;
+      } else if (text === '/dossier_cancel') {
+        userStates.delete(id);
+        await ctx.reply("❌ Составление досье отменено.", backMainKeyboard);
+        return;
+      }
+      
+      const entry: DossierEntry = {
+        id: Math.random().toString(36).slice(2, 8).toUpperCase(),
+        type: 'note',
+        value: text,
+        results: '',
+        icon: '',
+        color: ''
+      };
+      if (/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(text)) entry.type = 'email';
+      else if (/^\+?\d{10,15}$/.test(text.replace(/[\s-]/g, ''))) entry.type = 'phone';
+      else if (/^[\w.-]+$/.test(text) && text.length < 30) entry.type = 'username';
+      else if (/^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(text)) entry.type = 'ip';
+      else if (/^[a-zA-Z0-9-]+\.[a-zA-Z]{2,}$/.test(text)) entry.type = 'domain';
+      
+      entry.value = text;
+      
+      // Save to userStates
+      const entries = (state as any).entries || [];
+      entries.push(entry);
+      userStates.set(id, { ...state, entries });
+      
+      await ctx.reply(
+        `✅ Добавлено: <b>${entry.type.toUpperCase()}</b>
+` +
+        `📝 <code>${text}</code>
+
+` +
+        `Всего записей: ${entries.length}
+` +
+        `Отправь ещё данные или <code>/dossier_done</code> для завершения.`,
+        { parse_mode: "HTML" }
+      );
+      return;
+    }
+    
+    // ─ Smart OSINT mode ─
+    if (state?.tab === "osint" && state.key === "smart") {
+      const text = ctx.message?.text?.trim() || '';
+      if (!text) return;
+      
+      // Detect type
+      let detectedType: string;
+      let platforms: { label: string; url: string; icon: string }[] = [];
+      
+      if (/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(text)) {
+        detectedType = 'email';
+        await ctx.reply(
+          `🔍 Обнаружен <b>EMAIL</b>: <code>${text}</code>\n\n` +
+          `Начинаю поиск по источникам...`,
+          { parse_mode: "HTML" }
+        );
+        await runSmartOsint(ctx, text, 'email');
+        return;
+      } else if (/^\+?\d{10,15}$/.test(text.replace(/[\s-]/g, ''))) {
+        detectedType = 'phone';
+        await ctx.reply(
+          `🔍 Обнаружен <b>ТЕЛЕФОН</b>: <code>${text}</code>\n\n` +
+          `Начинаю поиск по источникам...`,
+          { parse_mode: "HTML" }
+        );
+        await runSmartOsint(ctx, text, 'phone');
+        return;
+      } else if (/^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(text)) {
+        detectedType = 'ip';
+        await ctx.reply(
+          `🔍 Обнаружен <b>IP АДРЕС</b>: <code>${text}</code>\n\n` +
+          `Начинаю поиск по источникам...`,
+          { parse_mode: "HTML" }
+        );
+        await runSmartOsint(ctx, text, 'ip');
+        return;
+      } else if (/^[a-zA-Z0-9-]+\.[a-zA-Z]{2,}$/.test(text)) {
+        detectedType = 'domain';
+        await ctx.reply(
+          `🔍 Обнаружен <b>ДОМЕН</b>: <code>${text}</code>\n\n` +
+          `Начинаю поиск по источникам...`,
+          { parse_mode: "HTML" }
+        );
+        await runSmartOsint(ctx, text, 'domain');
+        return;
+      } else if (/^[\w.-]+$/.test(text) && text.length < 30) {
+        detectedType = 'username';
+        await ctx.reply(
+          `🔍 Обнаружен <b>ЛОГИН</b>: <code>@${text}</code>\n\n` +
+          `Начинаю поиск по источникам...`,
+          { parse_mode: "HTML" }
+        );
+        await runSmartOsint(ctx, text, 'username');
+        return;
+      } else {
+        // Fallback - treat as username
+        detectedType = 'username';
+        await ctx.reply(
+          `🔍 Обнаружен <b>НИК/ИМЯ</b>: <code>${text}</code>\n\n` +
+          `Начинаю поиск по источникам...`,
+          { parse_mode: "HTML" }
+        );
+        await runSmartOsint(ctx, text, 'username');
+        return;
+      }
+    }
+    
     if (!state) return;
 
     userStates.delete(id);

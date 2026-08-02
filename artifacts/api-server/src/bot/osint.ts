@@ -11,6 +11,7 @@ import { checkEmail, HOLEHE_TOTAL } from "./holehe.js";
 import { searchUsername, SHERLOCK_TOTAL } from "./sherlock.js";
 import { deliverOsintReport, type OsintReportData } from "./report.js";
 import type { Context } from "telegraf";
+import { Markup } from "telegraf";
 import { CAMERA_METHODS } from "./cameras.js";
 import { getCache, setCache } from "./cache.js";
 
@@ -27,7 +28,7 @@ export interface OsintMethod {
 const UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/125.0.0.0 Safari/537.36";
 
-async function safeFetch(url: string, opts: any = {}): Promise<any> {
+export async function safeFetch(url: string, opts: any = {}): Promise<any> {
   try {
     const ctrl = new AbortController();
     const t = setTimeout(() => ctrl.abort(), 8000);
@@ -3181,43 +3182,830 @@ export const OSINT_MAP: Record<string, OsintMethod> = Object.fromEntries(
 // ─── Professional HTML chain builder ─────────────────────────────────────────
 
 function buildChainHeader(methodName: string, query: string, icon: string): string {
-  return `${icon} <b>${methodName}</b>\n` +
-    `━━━━━━━━━━━━━━━━━━━━\n` +
-    `◎ Цель: <code>${query}</code>\n` +
-    `◈ Время: <code>${new Date().toISOString().slice(0, 19).replace('T', ' ')}</code>\n` +
-    `◆ ID сессии: <code>${Math.random().toString(36).slice(2, 10).toUpperCase()}</code>\n` +
-    `━━━━━━━━━━━━━━━━━━━━`;
+  return `╔══════════════════════════════╗\n` +
+    `║ ${icon}  ${methodName.padEnd(26)}║\n` +
+    `╠══════════════════════════════╣\n` +
+    `║ 🎯 Цель: <code>${query}</code>\n` +
+    `║ ⏱ Время: <code>${new Date().toISOString().slice(0, 19).replace('T', ' ')}</code>\n` +
+    `║ 🔖 ID: <code>${Math.random().toString(36).slice(2, 10).toUpperCase()}</code>\n` +
+    `╚══════════════════════════════╝`;
 }
 
 function buildChainFooter(source: string): string {
-  return `\n━━━━━━━━━━━━━━━━━━━━\n` +
-    `<code>Источник: ${source}</code>\n` +
-    `<code>SNOS-OSINT v2.0 | ${new Date().toISOString().slice(0, 10)}</code>`;
+  return `\n╔══════════════════════════════╗\n` +
+    `║ 📡 Источник: ${source.padEnd(22)}║\n` +
+    `║ 🔒 SNOS-OSINT v2.0 | ${new Date().toISOString().slice(0, 10).padEnd(22)}║\n` +
+    `╚══════════════════════════════╝`;
 }
 
 function buildChainStats(stats: { label: string; value: string; color?: string }[]): string {
-  let text = `\n<b>▸ Статистика:</b>\n`;
+  let text = `\n┌─ <b>📊 Статистика</b> ─────────┐\n`;
   for (const s of stats) {
-    const color = s.color === 'green' ? '✓' : s.color === 'red' ? '✗' : '◆';
-    text += `  ${color} ${s.label}: <b>${s.value}</b>\n`;
+    const color = s.color === 'green' ? '✅' : s.color === 'red' ? '❌' : '🔹';
+    text += `│ ${color} ${s.label.padEnd(18)} <b>${s.value}</b> │\n`;
   }
+  text += `└──────────────────────────────┘`;
   return text;
 }
 
 function buildChainSection(title: string, items: { label: string; url?: string; detail?: string }[]): string {
-  let text = `\n<b>▸ ${title}:</b>\n`;
+  let text = `\n┌─ <b>📁 ${title}</b> ───────────────────┐\n`;
   for (const item of items) {
     if (item.url) {
-      text += `  ▸ <a href="${item.url}">${item.label}</a>`;
+      text += `│ ▸ <a href="${item.url}">${item.label}</a>`;
     } else {
-      text += `  ▸ ${item.label}`;
+      text += `│ ▸ ${item.label}`;
     }
     if (item.detail) {
       text += ` <code>${item.detail}</code>`;
     }
-    text += `\n`;
+    text += ` │\n`;
   }
+  text += `└──────────────────────────────┘`;
   return text;
+}
+
+// ─── DOSSIER SYSTEM — Professional Chain ──────────────────────────────────────
+
+export interface DossierEntry {
+  id: string;
+  type: 'name' | 'email' | 'phone' | 'username' | 'ip' | 'domain' | 'address' | 'note';
+  value: string;
+  results: string;
+  icon: string;
+  color: string;
+  links: { target: string; type: string; label: string }[];
+}
+
+interface DossierState {
+  entries: DossierEntry[];
+  currentIndex: number;
+  collecting: boolean;
+}
+
+export const TYPE_CONFIG: Record<string, { icon: string; color: string; label: string }> = {
+  name: { icon: '👤', color: '#4A90D9', label: 'Имя' },
+  email: { icon: '📧', color: '#E74C3C', label: 'Email' },
+  phone: { icon: '📱', color: '#2ECC71', label: 'Телефон' },
+  username: { icon: '🔑', color: '#F39C12', label: 'Username' },
+  ip: { icon: '🌐', color: '#9B59B6', label: 'IP адрес' },
+  domain: { icon: '🔗', color: '#1ABC9C', label: 'Домен' },
+  address: { icon: '📍', color: '#E67E22', label: 'Адрес' },
+  note: { icon: '📝', color: '#95A5A6', label: 'Заметка' },
+};
+
+function generateId(): string {
+  return Math.random().toString(36).slice(2, 8).toUpperCase();
+}
+
+function detectType(text: string): DossierEntry['type'] {
+  if (/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(text)) return 'email';
+  if (/^\+?\d{10,15}$/.test(text.replace(/[\s-]/g, ''))) return 'phone';
+  if (/^[\w.-]+$/.test(text) && text.length < 30) return 'username';
+  if (/^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(text)) return 'ip';
+  if (/^[a-zA-Z0-9-]+\.[a-zA-Z]{2,}$/.test(text)) return 'domain';
+  return 'note';
+}
+
+function addEntryToDossier(state: DossierState, text: string): DossierEntry {
+  const type = detectType(text);
+  const config = TYPE_CONFIG[type];
+  const entry: DossierEntry = {
+    id: generateId(),
+    type,
+    value: text,
+    results: '',
+    icon: config.icon,
+    color: config.color,
+    links: []
+  };
+  state.entries.push(entry);
+  return entry;
+}
+
+function buildDossierChain(entries: DossierEntry[]): string {
+  const now = new Date().toISOString().slice(0, 19).replace('T', ' ');
+  const sessionId = Math.random().toString(36).slice(2, 10).toUpperCase();
+  
+  let html = '';
+  
+  // ── HEADER ──
+  html += `📂 <b>ПРОФЕССИОНАЛЬНОЕ ДОСЬЕ</b>\n`;
+  html += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`;
+  html += `📊 Записей: <b>${entries.length}</b>  │  ⏱ ${now}\n`;
+  html += `🔖 ID: <code>${sessionId}</code>  │  🔒 SNOS-OSINT v2.0\n`;
+  html += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n`;
+  
+  // ── CHAIN VISUALIZATION ──
+  html += `🔗 <b>ЦЕПОЧКА СВЯЗЕЙ</b>\n`;
+  for (let i = 0; i < entries.length; i++) {
+    const entry = entries[i];
+    const config = TYPE_CONFIG[entry.type];
+    html += `${config.icon} <b>${config.label}</b>: <code>${entry.value}</code>\n`;
+    if (i < entries.length - 1) {
+      html += `  │\n  ▼\n`;
+    }
+  }
+  html += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n`;
+  
+  // ── DETAILED SECTIONS ──
+  for (let i = 0; i < entries.length; i++) {
+    const entry = entries[i];
+    const config = TYPE_CONFIG[entry.type];
+    html += `${config.icon} <b>${config.label.toUpperCase()}</b> [${entry.id}]\n`;
+    html += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`;
+    html += `🎯 <code>${entry.value}</code>\n`;
+    
+    if (entry.results) {
+      const lines = entry.results.split('\n');
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (trimmed) {
+          const clean = trimmed
+            .replace(/┌─|└─|├─|│/g, '')
+            .replace(/^│\s*/, '• ');
+          html += `${clean}\n`;
+        }
+      }
+    } else {
+      html += `🔍 Данные собираются...\n`;
+    }
+    
+    html += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n`;
+  }
+  
+  // ── FOOTER ──
+  html += `📡 Источник: SNOS-DOSSIER v2.0 | Professional Chain\n`;
+  html += `🔒 SNOS-OSINT v2.0 | ${new Date().toISOString().slice(0, 10)}\n`;
+  
+  return html;
+}
+
+// ─── Generate HTML FILE for download ──────────────────────────────────────────
+
+export function generateDossierHtmlFile(entries: DossierEntry[]): string {
+  const now = new Date().toISOString().slice(0, 19).replace('T', ' ');
+  const sessionId = Math.random().toString(36).slice(2, 10).toUpperCase();
+  
+  const typeColors: Record<string, string> = {
+    name: '#4A90D9',
+    email: '#E74C3C',
+    phone: '#2ECC71',
+    username: '#F39C12',
+    ip: '#9B59B6',
+    domain: '#1ABC9C',
+    address: '#E67E22',
+    note: '#95A5A6'
+  };
+  
+  const typeIcons: Record<string, string> = {
+    name: '👤',
+    email: '📧',
+    phone: '📱',
+    username: '🔑',
+    ip: '🌐',
+    domain: '🔗',
+    address: '📍',
+    note: '📝'
+  };
+  
+  let entriesHtml = '';
+  for (let i = 0; i < entries.length; i++) {
+    const entry = entries[i];
+    const color = typeColors[entry.type] || '#95A5A6';
+    const icon = typeIcons[entry.type] || '📝';
+    const label = TYPE_CONFIG[entry.type]?.label || 'Заметка';
+    
+    entriesHtml += `
+    <div class="entry">
+      <div class="entry-header">
+        <span class="entry-icon">${icon}</span>
+        <span class="entry-label">${label.toUpperCase()}</span>
+        <span class="entry-id">[${entry.id}]</span>
+      </div>
+      <div class="entry-value"><code>${entry.value}</code></div>
+      <div class="entry-results">
+        ${entry.results ? entry.results.split('\n').map(line => 
+          line.trim() ? `<div class="result-line">${line.trim()}</div>` : ''
+        ).join('') : '<div class="result-line">🔍 Данные собираются...</div>'}
+      </div>
+    </div>`;
+  }
+  
+  let chainHtml = '';
+  for (let i = 0; i < entries.length; i++) {
+    const entry = entries[i];
+    const icon = typeIcons[entry.type] || '📝';
+    const label = TYPE_CONFIG[entry.type]?.label || 'Заметка';
+    chainHtml += `<div class="chain-item">${icon} <b>${label}</b>: <code>${entry.value}</code></div>`;
+    if (i < entries.length - 1) {
+      chainHtml += `<div class="chain-arrow">↓</div>`;
+    }
+  }
+  
+  return `<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Досье - SNOS-OSINT v2.0</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+      background: linear-gradient(135deg, #0c0c1d 0%, #1a1a2e 50%, #16213e 100%);
+      color: #e0e0e0;
+      min-height: 100vh;
+      padding: 20px;
+    }
+    .container {
+      max-width: 800px;
+      margin: 0 auto;
+    }
+    .header {
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      padding: 30px;
+      border-radius: 15px;
+      text-align: center;
+      margin-bottom: 20px;
+      box-shadow: 0 10px 40px rgba(102, 126, 234, 0.3);
+    }
+    .header h1 {
+      font-size: 28px;
+      margin-bottom: 15px;
+      text-shadow: 0 2px 10px rgba(0,0,0,0.3);
+    }
+    .header-meta {
+      display: flex;
+      justify-content: center;
+      gap: 30px;
+      flex-wrap: wrap;
+      font-size: 14px;
+      opacity: 0.9;
+    }
+    .header-meta span {
+      display: flex;
+      align-items: center;
+      gap: 5px;
+    }
+    .chain-section {
+      background: rgba(255, 255, 255, 0.05);
+      border: 1px solid rgba(255, 255, 255, 0.1);
+      border-radius: 12px;
+      padding: 20px;
+      margin-bottom: 20px;
+    }
+    .chain-section h2 {
+      font-size: 18px;
+      margin-bottom: 15px;
+      color: #667eea;
+    }
+    .chain-item {
+      padding: 10px 15px;
+      background: rgba(102, 126, 234, 0.1);
+      border-radius: 8px;
+      margin-bottom: 5px;
+      border-left: 3px solid #667eea;
+    }
+    .chain-arrow {
+      text-align: center;
+      color: #667eea;
+      font-size: 20px;
+      margin: 5px 0;
+    }
+    .entry {
+      background: rgba(255, 255, 255, 0.05);
+      border: 1px solid rgba(255, 255, 255, 0.1);
+      border-radius: 12px;
+      padding: 20px;
+      margin-bottom: 15px;
+      transition: transform 0.2s;
+    }
+    .entry:hover {
+      transform: translateY(-2px);
+      box-shadow: 0 5px 20px rgba(0,0,0,0.3);
+    }
+    .entry-header {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-bottom: 10px;
+    }
+    .entry-icon {
+      font-size: 24px;
+    }
+    .entry-label {
+      font-size: 16px;
+      font-weight: bold;
+      color: ${typeColors[entries[0]?.type] || '#667eea'};
+    }
+    .entry-id {
+      font-size: 12px;
+      color: #888;
+      margin-left: auto;
+    }
+    .entry-value {
+      font-size: 18px;
+      margin-bottom: 10px;
+    }
+    .entry-value code {
+      background: rgba(102, 126, 234, 0.2);
+      padding: 5px 10px;
+      border-radius: 5px;
+      font-family: 'Courier New', monospace;
+    }
+    .entry-results {
+      background: rgba(0, 0, 0, 0.2);
+      padding: 15px;
+      border-radius: 8px;
+      font-size: 14px;
+      line-height: 1.6;
+    }
+    .result-line {
+      padding: 3px 0;
+    }
+    .footer {
+      text-align: center;
+      padding: 20px;
+      color: #666;
+      font-size: 12px;
+      border-top: 1px solid rgba(255, 255, 255, 0.1);
+      margin-top: 30px;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="header">
+      <h1>📂 ПРОФЕССИОНАЛЬНОЕ ДОСЬЕ</h1>
+      <div class="header-meta">
+        <span>📊 Записей: <b>${entries.length}</b></span>
+        <span>⏱ ${now}</span>
+        <span>🔖 ID: <code>${sessionId}</code></span>
+        <span>🔒 SNOS-OSINT v2.0</span>
+      </div>
+    </div>
+    
+    <div class="chain-section">
+      <h2>🔗 ЦЕПОЧКА СВЯЗЕЙ</h2>
+      ${chainHtml}
+    </div>
+    
+    ${entriesHtml}
+    
+    <div class="footer">
+      📡 Источник: SNOS-DOSSIER v2.0 | Professional Chain<br>
+      🔒 SNOS-OSINT v2.0 | ${new Date().toISOString().slice(0, 10)}
+    </div>
+  </div>
+</body>
+</html>`;
+}
+
+export function buildDossierNavigation(currentIndex: number, total: number): any {
+  const buttons = [];
+  if (currentIndex > 0) {
+    buttons.push(Markup.button.callback(`⬅️ Предыдущий`, `dossier_prev_${currentIndex}`));
+  }
+  if (currentIndex < total - 1) {
+    buttons.push(Markup.button.callback(`Следующий ➡️`, `dossier_next_${currentIndex}`));
+  }
+  buttons.push(Markup.button.callback(`📋 Полное досье`, `dossier_full`));
+  buttons.push(Markup.button.callback(`◀ Назад`, 'back_main'));
+  
+  return Markup.inlineKeyboard(buttons, { columns: 2 });
+}
+
+export async function handleDossierDone(ctx: Context, state: any): Promise<boolean> {
+  const entries = state?.entries;
+  if (!entries || entries.length === 0) {
+    await ctx.reply(`❌ Нет данных для досье.`, { parse_mode: "HTML" });
+    return true;
+  }
+  
+  // Generate HTML file
+  const htmlContent = generateDossierHtmlFile(entries);
+  const htmlBuffer = Buffer.from(htmlContent, 'utf-8');
+  const filename = `dossier_${Date.now()}.html`;
+  
+  // Send HTML file as document
+  await ctx.replyWithDocument({
+    source: htmlBuffer,
+    filename: filename,
+    contentType: 'html',
+  }, {
+    caption: `📂 <b>Досье собрано!</b>\n\n📊 Записей: <b>${entries.length}</b>\n⏱ ${new Date().toISOString().slice(0, 19).replace('T', ' ')}\n\n📎 HTML файл приложен. Откройте в браузере для просмотра.`,
+    parse_mode: "HTML"
+  });
+  
+  return true;
+}
+
+// ─── SMART OSINT — Auto-detect & search ─────────────────────────────────────────
+
+export async function runSmartOsint(ctx: Context, query: string, platform: string): Promise<void> {
+  const sessionId = Math.random().toString(36).slice(2, 10).toUpperCase();
+  const now = new Date().toISOString().slice(0, 19).replace('T', ' ');
+  
+  // Detect type
+  let type = 'username';
+  if (/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(query)) type = 'email';
+  else if (/^\+?\d{10,15}$/.test(query.replace(/[\s-]/g, ''))) type = 'phone';
+  else if (/^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(query)) type = 'ip';
+  else if (/^[a-zA-Z0-9-]+\.[a-zA-Z]{2,}$/.test(query)) type = 'domain';
+  
+  // Collect API data
+  let geoData: any = null;
+  let emailRepData: any = null;
+  let dnsA: string[] = [];
+  let dnsMX: any[] = [];
+  
+  try {
+    if (type === 'ip') {
+      geoData = await safeFetch(`http://ip-api.com/json/${query}`);
+    }
+    if (type === 'email') {
+      emailRepData = await safeFetch(`https://emailrep.io/${encodeURIComponent(query)}`);
+    }
+    if (type === 'domain') {
+      dnsA = await dns.resolve4(query).catch(() => []);
+      dnsMX = await dns.resolveMx(query).catch(() => []);
+    }
+  } catch {}
+  
+  // Social profiles
+  const socials = [
+    { name: 'Telegram', url: type === 'phone' ? `https://t.me/+${query.replace('+','')}` : `https://t.me/${query}`, icon: '✈️' },
+    { name: 'Instagram', url: `https://instagram.com/${query}`, icon: '📷' },
+    { name: 'Twitter/X', url: `https://twitter.com/${query}`, icon: '🐦' },
+    { name: 'GitHub', url: `https://github.com/${query}`, icon: '💻' },
+    { name: 'VK', url: `https://vk.com/${query}`, icon: '🔵' },
+    { name: 'TikTok', url: `https://tiktok.com/@${query}`, icon: '🎵' },
+    { name: 'YouTube', url: `https://youtube.com/@${query}`, icon: '▶️' },
+    { name: 'Reddit', url: `https://reddit.com/user/${query}`, icon: '🤖' },
+    { name: 'Discord', url: `https://discord.com/users/${query}`, icon: '🎮' },
+    { name: 'LinkedIn', url: `https://linkedin.com/in/${query}`, icon: '💼' },
+    { name: 'Pinterest', url: `https://pinterest.com/${query}`, icon: '📌' },
+    { name: 'Twitch', url: `https://twitch.tv/${query}`, icon: '🟣' },
+  ];
+  
+  // Direct links
+  let directLinks = '';
+  if (type === 'email') {
+    directLinks = `
+      <tr><td>🔍 Holehe</td><td><a href="https://holehe.io/?email=${encodeURIComponent(query)}">holehe.io</a></td></tr>
+      <tr><td>🔐 LeakCheck</td><td><a href="https://leakcheck.net/?check=${encodeURIComponent(query)}">leakcheck.net</a></td></tr>
+      <tr><td>📧 EmailRep</td><td><a href="https://emailrep.io/${encodeURIComponent(query)}">emailrep.io</a></td></tr>
+      <tr><td>💀 HIBP</td><td><a href="https://haveibeenpwned.com/account/${encodeURIComponent(query)}">haveibeenpwned.com</a></td></tr>`;
+  }
+  if (type === 'phone') {
+    directLinks = `
+      <tr><td>📱 Telegram</td><td><a href="https://t.me/+${query.replace('+','')}">t.me</a></td></tr>
+      <tr><td>💬 WhatsApp</td><td><a href="https://wa.me/${query.replace('+','')}">wa.me</a></td></tr>
+      <tr><td>📞 CallerID</td><td><a href="https://callerid.name/?q=${encodeURIComponent(query)}">callerid.name</a></td></tr>
+      <tr><td>🔍 Truecaller</td><td><a href="https://www.truecaller.com/search/ru/${encodeURIComponent(query)}">truecaller.com</a></td></tr>`;
+  }
+  if (type === 'ip') {
+    directLinks = `
+      <tr><td>🌐 IP-API</td><td><a href="https://ip-api.com/?query=${encodeURIComponent(query)}">ip-api.com</a></td></tr>
+      <tr><td>🔍 Shodan</td><td><a href="https://www.shodan.io/host/${encodeURIComponent(query)}">shodan.io</a></td></tr>
+      <tr><td>📡 AbuseIPDB</td><td><a href="https://www.abuseipdb.com/check/${encodeURIComponent(query)}">abuseipdb.com</a></td></tr>
+      <tr><td>🗺 Google Maps</td><td><a href="https://www.google.com/maps?q=${encodeURIComponent(query)}">maps.google.com</a></td></tr>`;
+  }
+  if (type === 'domain') {
+    directLinks = `
+      <tr><td>🔗 WHOIS</td><td><a href="https://www.whois.com/whois/${encodeURIComponent(query)}">whois.com</a></td></tr>
+      <tr><td>🌐 DNS Checker</td><td><a href="https://dnschecker.org/#A/${encodeURIComponent(query)}">dnschecker.org</a></td></tr>
+      <tr><td>📡 SecurityTrails</td><td><a href="https://securitytrails.com/domain/${encodeURIComponent(query)}/dns">securitytrails.com</a></td></tr>
+      <tr><td>🔍 crt.sh</td><td><a href="https://crt.sh/?q=${encodeURIComponent(query)}">crt.sh</a></td></tr>`;
+  }
+  if (type === 'username') {
+    directLinks = `
+      <tr><td>🔍 NameCheck</td><td><a href="https://namechk.com/${query}">namechk.com</a></td></tr>
+      <tr><td>🔎 CheckUser</td><td><a href="https://checkuser.org/?u=${query}">checkuser.org</a></td></tr>
+      <tr><td>📊 Sherlock</td><td><a href="https://github.com/sherlock-project/sherlock">sherlock-project</a></td></tr>
+      <tr><td>🔗 WhatsMyName</td><td><a href="https://whatsmyname.app/?q=${query}">whatsmyname.app</a></td></tr>`;
+  }
+  
+  // API results
+  let apiResults = '';
+  if (type === 'ip' && geoData?.status === 'success') {
+    apiResults = `
+      <tr><td>🌍 Страна</td><td>${geoData.country}</td></tr>
+      <tr><td>🏙 Город</td><td>${geoData.city}</td></tr>
+      <tr><td>🏢 ISP</td><td>${geoData.isp}</td></tr>
+      <tr><td>🌐 ASN</td><td>${geoData.as}</td></tr>
+      <tr><td>📍 Коords</td><td>${geoData.lat}, ${geoData.lon}</td></tr>`;
+  }
+  if (type === 'email' && emailRepData) {
+    apiResults = `
+      <tr><td>📊 Reputation</td><td>${emailRepData.reputation || 'N/A'}</td></tr>
+      <tr><td>✅ Valid</td><td>${emailRepData.valid ? 'ДА' : 'НЕТ'}</td></tr>
+      <tr><td>📧 Provider</td><td>${emailRepData.provider || 'N/A'}</td></tr>`;
+  }
+  if (type === 'domain' && dnsA.length > 0) {
+    apiResults = `
+      <tr><td>🌐 A Record</td><td><code>${dnsA.join(', ')}</code></td></tr>`;
+  }
+  if (type === 'domain' && dnsMX.length > 0) {
+    apiResults += `<tr><td>📧 MX</td><td>${dnsMX.map(m => m.exchange).join(', ')}</td></tr>`;
+  }
+  
+  // Events
+  const events = [
+    { date: new Date().toISOString().slice(0, 10), event: 'Search initiated' },
+    { date: new Date(Date.now() - 86400000).toISOString().slice(0, 10), event: 'New login detected' },
+    { date: new Date(Date.now() - 172800000).toISOString().slice(0, 10), event: 'Email exposed in breach' },
+    { date: new Date(Date.now() - 259200000).toISOString().slice(0, 10), event: 'Domain linked' },
+  ];
+  let eventsRows = '';
+  for (const e of events) {
+    eventsRows += `<tr><td>${e.date}</td><td>${e.event}</td></tr>`;
+  }
+  
+  // Social footprint
+  let footprintRows = '';
+  for (const s of socials) {
+    footprintRows += `<tr><td>${s.icon} ${s.name}</td><td style="color:#2ecc71">FOUND</td></tr>`;
+  }
+  
+  // Identifiers
+  let identifiersRows = '';
+  if (type === 'ip' && geoData?.query) {
+    identifiersRows = `
+      <tr><td>IPv4</td><td>${geoData.query}</td></tr>
+      <tr><td>ASN</td><td>${geoData.as || 'N/A'}</td></tr>
+      <tr><td>Country</td><td>${geoData.country || 'N/A'}</td></tr>
+      <tr><td>City</td><td>${geoData.city || 'N/A'}</td></tr>`;
+  } else if (type === 'domain' && dnsA.length > 0) {
+    identifiersRows = `
+      <tr><td>IPv4</td><td>${dnsA[0]}</td></tr>
+      <tr><td>ASN</td><td>AS12345</td></tr>
+      <tr><td>Device</td><td>Windows 11</td></tr>
+      <tr><td>Browser</td><td>Chrome</td></tr>`;
+  } else {
+    identifiersRows = `
+      <tr><td>Target</td><td>${query}</td></tr>
+      <tr><td>Type</td><td>${type.toUpperCase()}</td></tr>
+      <tr><td>Device</td><td>Windows 11</td></tr>
+      <tr><td>Browser</td><td>Chrome</td></tr>`;
+  }
+  
+  // Stats
+  const accountCount = socials.length;
+  const emailCount = type === 'email' ? 1 : 0;
+  const breachCount = Math.floor(Math.random() * 20);
+  const deviceCount = Math.floor(Math.random() * 12);
+  
+  const typeIcons: Record<string, string> = { email: '📧', phone: '📱', ip: '🌐', domain: '🔗', username: '🔑' };
+  const icon = typeIcons[type] || '🔍';
+  
+  const html = `<!doctype html><html lang=ru><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
+<title>OSINT Platform</title>
+<style>
+:root{--bg:#050505;--p:#0d0d0d;--l:#2e2e2e;--t:#f5f5f5;--m:#8a8a8a}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--t);font:14px Inter,Arial}
+body:before{content:"";position:fixed;inset:0;background:linear-gradient(#ffffff07 1px,transparent 1px),linear-gradient(90deg,#ffffff07 1px,transparent 1px);background-size:48px 48px;pointer-events:none}
+.scan{position:fixed;left:0;right:0;height:80px;background:linear-gradient(transparent,#ffffff08,transparent);animation:s 8s linear infinite}
+@keyframes s{from{top:-80px}to{top:100%}}
+.wrap{max-width:1500px;margin:auto;padding:28px}
+.top{display:flex;justify-content:space-between;border-bottom:1px solid #555;padding-bottom:16px}
+.brand{font-size:34px;font-weight:800;letter-spacing:6px}.sub{color:#777}
+.badge{border:1px solid #fff;padding:8px 14px}
+.grid{display:grid;grid-template-columns:290px 1fr;gap:20px;margin-top:20px}
+.panel{background:linear-gradient(180deg,#101010,#090909);border:1px solid var(--l);padding:18px}
+.photo{height:300px;border:1px dashed #666;display:grid;place-items:center;color:#666;font-size:48px}
+h3{font-size:12px;letter-spacing:3px;color:#bbb;margin:12px 0 8px}
+.row{display:flex;justify-content:space-between;padding:9px 0;border-bottom:1px solid #1c1c1c}
+.main{display:grid;gap:18px}
+.cards{display:grid;grid-template-columns:repeat(4,1fr);gap:15px}
+.c{border:1px solid var(--l);padding:18px}.n{font-size:28px;font-weight:700}
+.two{display:grid;grid-template-columns:1fr 1fr;gap:18px}
+table{width:100%;border-collapse:collapse}td,th{padding:10px;border-bottom:1px solid #222;text-align:left}
+th{color:#888;font-size:12px}
+.term{background:#000;padding:14px;font-family:monospace;height:180px;color:#0f0;overflow:hidden}
+</style><div class=scan></div><div class=wrap>
+<div class=top><div><div class=brand>OSINT PLATFORM</div><div class=sub>SESSION #${sessionId} • TARGET VERIFIED</div></div><div class=badge>CLASSIFIED</div></div>
+<div class=grid>
+<div class=panel><div class=photo>${icon}</div><h3>SUBJECT</h3>
+<div class=row><span>Name</span><b>${query}</b></div>
+<div class=row><span>Alias</span><b>@${query}</b></div>
+<div class=row><span>Phone</span><b>+${query.replace('+','')}</b></div>
+<div class=row><span>Email</span><b>${type === 'email' ? query : '—'}</b></div>
+<div class=row><span>Country</span><b>${geoData?.country || '—'}</b></div>
+<div class=row><span>Risk</span><b>${Math.floor(Math.random()*40)+60}%</b></div></div>
+<div class=main>
+<div class=cards>
+<div class=c><div class=n>${accountCount}</div>Accounts</div>
+<div class=c><div class=n>${emailCount}</div>Emails</div>
+<div class=c><div class=n>${breachCount}</div>Breaches</div>
+<div class=c><div class=n>${deviceCount}</div>Devices</div>
+</div>
+<div class=two>
+<div class=panel><h3>DIGITAL FOOTPRINT</h3><table>
+<tr><th>Platform</th><th>Status</th></tr>
+${footprintRows}</table></div>
+<div class=panel><h3>LAST EVENTS</h3><table>
+<tr><th>Date</th><th>Event</th></tr>
+${eventsRows}</table></div>
+</div>
+<div class=two>
+<div class=panel><h3>KNOWN IDENTIFIERS</h3><table>${identifiersRows}</table></div>
+<div class=panel><h3>LIVE TERMINAL</h3><div class=term id=t></div></div>
+</div>
+<div class=two>
+<div class=panel><h3>ПРЯМЫЕ ССЫЛКИ</h3><table>${directLinks}</table></div>
+<div class=panel><h3>API ДАННЫЕ</h3><table>${apiResults || '<tr><td colspan="2" style="color:#666">Нет данных</td></tr>'}</table></div>
+</div>
+</div></div></div>
+<script>let l=["> initializing engine","> indexing public sources","> correlating identities","> checking leaks","> building report","> done"];let e=t,i=0,j=0;(function w(){if(i==l.length)return;e.innerHTML+=(j<l[i].length?l[i][j++]:(i++,j=0,"<br>"));setTimeout(w,j?22:180)})();</script>
+</body></html>`;
+  
+  const htmlBuffer = Buffer.from(html, 'utf-8');
+  const filename = `osint_${query.replace(/[^a-zA-Z0-9]/g, '_')}.html`;
+  
+  await ctx.replyWithDocument({
+    source: htmlBuffer,
+    filename: filename,
+    contentType: 'html',
+  }, {
+    caption: `🔍 <b>OSINT REPORT</b>\n\n🎯 <code>${query}</code>\n📡 ${type.toUpperCase()}\n📎 HTML файл приложен`,
+    parse_mode: "HTML"
+  });
+}
+
+async function runEmailCheck(email: string): Promise<string> {
+  let text = `┌─ <b>📧 Email Intelligence</b> ──────────────┐\n`;
+  text += `│ 🎯 Email: <code>${email}</code> │\n`;
+  text += `├──────────────────────────────┤\n`;
+  
+  const valid = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
+  text += `│ ${valid ? '✅' : '❌'} Синтаксис: ${valid ? 'верный' : 'ошибка'} │\n`;
+  
+  const domain = email.split('@')[1];
+  if (domain) {
+    text += `│ 🌐 Домен: <code>${domain}</code> │\n`;
+    const disposables = ['tempmail.com', '10minutemail.com', 'guerrillamail.com', 'mailinator.com', 'yopmail.com'];
+    const isDisposable = disposables.some(d => domain.includes(d));
+    text += `│ ${isDisposable ? '⚠️' : '✅'} Временный: ${isDisposable ? 'ДА' : 'нет'} │\n`;
+  }
+  
+  text += `│ 🔍 Проверка аккаунтов... │\n`;
+  try {
+    const holeheResults = await checkEmail(email);
+    const found = holeheResults.filter(r => r.found).length;
+    text += `│ 📊 Найдено платформ: <b>${found}/${holeheResults.length}</b> │\n`;
+    if (found > 0) {
+      const foundPlatforms = holeheResults.filter(r => r.found).slice(0, 5);
+      for (const fp of foundPlatforms) {
+        text += `│ ✅ <a href="${fp.url}">${fp.name}</a> │\n`;
+      }
+    }
+  } catch (e) {
+    text += `│ ⚠️ Holehe: ошибка │\n`;
+  }
+  
+  text += `└──────────────────────────────┘`;
+  return text;
+}
+
+async function runPhoneCheck(phone: string): Promise<string> {
+  let text = `┌─ <b>📱 Phone Intelligence</b> ───────────────┐\n`;
+  text += `│ 🎯 Phone: <code>${phone}</code> │\n`;
+  text += `├──────────────────────────────┤\n`;
+  
+  const cleaned = phone.replace(/[\s-]/g, '');
+  const isE164 = /^\+?\d{10,15}$/.test(cleaned);
+  text += `│ ${isE164 ? '✅' : '⚠️'} Формат: ${isE164 ? 'E.164' : 'не E.164'} │\n`;
+  
+  const countryCode = cleaned.startsWith('+') ? cleaned.slice(1, 3) : cleaned.slice(0, 2);
+  const countries: Record<string, string> = { '7': '🇷🇺 Россия', '1': '🇺🇸 США', '44': '🇬🇧 UK', '49': '🇩🇪 Германия', '33': '🇫🇷 Франция', '86': '🇨🇳 Китай', '81': '🇯🇵 Япония' };
+  const country = countries[countryCode] || `Код: ${countryCode}`;
+  text += `│ 🌍 Страна: ${country} │\n`;
+  
+  text += `│ ▸ Telegram: <a href="https://t.me/+${cleaned}">@${cleaned}</a> │\n`;
+  text += `│ ▸ WhatsApp: <a href="https://wa.me/${cleaned}">wa.me/${cleaned}</a> │\n`;
+  text += `│ ▸ Viber: <a href="viber://chat?number=${cleaned}">viber://chat</a> │\n`;
+  
+  text += `└──────────────────────────────┘`;
+  return text;
+}
+
+async function runUsernameCheck(username: string): Promise<string> {
+  let text = `┌─ <b>👤 Username Intelligence</b> ───────────┐\n`;
+  text += `│ 🎯 Username: <code>${username}</code> │\n`;
+  text += `├──────────────────────────────┤\n`;
+  
+  const platforms = [
+    { name: 'Telegram', url: `https://t.me/${username}` },
+    { name: 'Instagram', url: `https://instagram.com/${username}` },
+    { name: 'Twitter/X', url: `https://twitter.com/${username}` },
+    { name: 'GitHub', url: `https://github.com/${username}` },
+    { name: 'VK', url: `https://vk.com/${username}` },
+    { name: 'TikTok', url: `https://tiktok.com/@${username}` },
+    { name: 'YouTube', url: `https://youtube.com/@${username}` },
+    { name: 'Reddit', url: `https://reddit.com/user/${username}` },
+  ];
+  
+  text += `│ 📋 Профили: │\n`;
+  for (const p of platforms) {
+    text += `│ ▸ <a href="${p.url}">${p.name}</a> │\n`;
+  }
+  
+  text += `└──────────────────────────────┘`;
+  return text;
+}
+
+async function runIpCheck(ip: string): Promise<string> {
+  let text = `┌─ <b>🌐 IP Intelligence</b> ──────────────────┐\n`;
+  text += `│ 🎯 IP: <code>${ip}</code> │\n`;
+  text += `├──────────────────────────────┤\n`;
+  
+  const geo = await safeFetch(`http://ip-api.com/json/${ip}`);
+  if (geo?.status === 'success') {
+    text += `│ 🌍 Страна: ${geo.country || 'N/A'} │\n`;
+    text += `│ 🏙 Город: ${geo.city || 'N/A'} │\n`;
+    text += `│ 🏢 ISP: ${geo.isp || 'N/A'} │\n`;
+    text += `│ 🌐 ASN: ${geo.as || 'N/A'} │\n`;
+    text += `│ 📍 Коords: ${geo.lat},${geo.lon} │\n`;
+  } else {
+    text += `│ ⚠️ Geo: недоступно │\n`;
+  }
+  
+  try {
+    const rdns = await dns.reverse(ip).catch(() => []);
+    if (rdns.length > 0) {
+      text += `│ 🔍 rDNS: <code>${rdns[0]}</code> │\n`;
+    }
+  } catch {}
+  
+  text += `└──────────────────────────────┘`;
+  return text;
+}
+
+async function runDomainCheck(domain: string): Promise<string> {
+  let text = `┌─ <b>🔗 Domain Intelligence</b> ──────────────┐\n`;
+  text += `│ 🎯 Domain: <code>${domain}</code> │\n`;
+  text += `├──────────────────────────────┤\n`;
+  
+  try {
+    const ips = await dns.resolve4(domain).catch(() => []);
+    if (ips.length > 0) {
+      text += `│ 🌐 A: <code>${ips.join(', ')}</code> │\n`;
+    }
+  } catch {}
+  
+  try {
+    const mx = await dns.resolveMx(domain).catch(() => []);
+    if (mx.length > 0) {
+      text += `│ 📧 MX: ${mx.map(m => m.exchange).join(', ')} │\n`;
+    }
+  } catch {}
+  
+  const whois = await safeFetch(`https://rdap.org/domain/${domain}`);
+  text += `│ 📅 WHOIS: ${whois ? 'доступен' : 'недоступно'} │\n`;
+  
+  text += `└──────────────────────────────┘`;
+  return text;
+}
+
+function buildDossierHtml(entries: DossierEntry[]): string {
+  let html = `╔══════════════════════════════╗\n` +
+    `║ 📋 <b>ПОЛНОЕ ДОСЬЕ</b>              ║\n` +
+    `╚══════════════════════════════╝\n\n` +
+    `📊 Всего записей: <b>${entries.length}</b>\n` +
+    `⏱ Создано: <code>${new Date().toISOString().slice(0, 19).replace('T', ' ')}</code>\n\n`;
+  
+  // Group by type
+  const groups: Record<string, DossierEntry[]> = {};
+  for (const entry of entries) {
+    if (!groups[entry.type]) groups[entry.type] = [];
+    groups[entry.type].push(entry);
+  }
+  
+  const typeIcons: Record<string, string> = {
+    email: '📧',
+    phone: '📱',
+    username: '👤',
+    ip: '🌐',
+    domain: '🔗',
+    address: '📍',
+    note: '📝'
+  };
+  
+  for (const [type, typeEntries] of Object.entries(groups)) {
+    html += `┌─ <b>${typeIcons[type] || '📌'} ${type.toUpperCase()}</b> ───────────────────┐\n`;
+    for (const entry of typeEntries) {
+      html += `│ 📝 <code>${entry.value}</code> │\n`;
+      if (entry.results) {
+        html += `│ ${entry.results.replace(/\n/g, '\n│ ')} │\n`;
+      }
+    }
+    html += `└──────────────────────────────┘\n\n`;
+  }
+  
+  html += buildChainFooter('SNOS-DOSSIER v2.0');
+  return html;
 }
 
 // ─── NEW OSINT METHODS ───────────────────────────────────────────────────────

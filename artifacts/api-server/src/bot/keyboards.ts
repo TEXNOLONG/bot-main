@@ -73,24 +73,10 @@ export const snosSessionsKeyboard = Markup.inlineKeyboard([
   [Markup.button.callback("◀ Назад", "snos_keyboard")],
 ]);
 
-// ─── OSINT — подкатегории с пагинацией ────────────────────────────────────────
+// ─── OSINT — упрощённая клавиатура ────────────────────────────────────────────
 export const osintKeyboard = Markup.inlineKeyboard([
-  [
-    Markup.button.callback("◎ Основные", "osint_cat_basic"),
-    Markup.button.callback("◎ Email", "osint_cat_email"),
-  ],
-  [
-    Markup.button.callback("◎ Телефон", "osint_cat_phone"),
-    Markup.button.callback("◎ Соцсети", "osint_cat_social"),
-  ],
-  [
-    Markup.button.callback("◎ Сеть", "osint_cat_network"),
-    Markup.button.callback("◎ Камеры", "osint_cat_cameras"),
-  ],
-  [
-    Markup.button.callback("◎ Углублённый", "osint_cat_deep"),
-    Markup.button.callback("🗄️ Базы утечек", "osint_dbsearch"),
-  ],
+  [Markup.button.callback("🔍 Умный OSINT", "osint_smart")],
+  [Markup.button.callback("📋 Составить досье", "osint_dossier")],
   [Markup.button.callback("◀ Назад", "back_main")],
 ]);
 
