@@ -1,0 +1,314 @@
+Что нужно сделать? 
+
+ Проблема с кодом - бот путается что делать.
+ 
+ Поиск (osint)
+пользователь кидает какую угодно информацию, но бот сам определяет что это и должен уточнять к примеру
+пользователь - 7307275806 
+бот - это id вк или тг? (по кнопкам)
+и так со всем
+ 
+ 1 поиск по вк  (если пользователь кидает (айди) -  сделать вк поиск может быть через сессию, вот пример
+ import requests
+import urllib3
+import json
+import time
+
+# Отключаем SSL предупреждения
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+# ВАШ НОВЫЙ ТОКЕН (из ссылки)
+TOKEN = "vk1.a.6jiSRi2h2yR5sQEBoD-a_5wab3pmA1B1-zrNLbifQYfr-jd4zGlCsdn7izh7SXjrUR5h_94_Rc6NR29tfF6n6ckJOUqAS9u5wo_ZF2lT9KIfH-r4_SBEX7mA7nrIso2PovLPR8edD-13y8lN4zXVtqmVOO1fnPBCCsrGlvLp15-Hh2XV0a8v5WbX5x2prP2uXDy3iFp0mVtalG8sBxFSHQ"
+
+# Информация о вашем аккаунте из ссылки
+MY_USER_ID = 707965330
+MY_EMAIL = "tormisha89@gmail.com"
+
+class VKAPIClient:
+    def __init__(self, token):
+        self.token = token
+        self.api_version = "5.131"
+        self.base_url = "https://api.vk.com/method/"
+        
+    def _request(self, method, params):
+        """Базовый метод для запросов к VK API"""
+        params.update({
+            'access_token': self.token,
+            'v': self.api_version
+        })
+        
+        try:
+            response = requests.get(
+                self.base_url + method,
+                params=params,
+                verify=False,
+                timeout=15
+            )
+            data = response.json()
+            
+            if 'error' in data:
+                print(f"❌ Ошибка API: {data['error']['error_msg']}")
+                return None
+            
+            return data.get('response', {})
+            
+        except Exception as e:
+            print(f"❌ Ошибка запроса: {e}")
+            return None
+    
+    def get_user(self, user_id, fields=None):
+        """
+        Получение информации о пользователе
+        fields: first_name,last_name,status,sex,bdate,city,country,photo_max_orig,online,last_seen,about,activities,interests,music,movies,books,games
+        """
+        if fields is None:
+            fields = "first_name,last_name,status,sex,bdate,city,country,photo_max_orig,online"
+        
+        params = {
+            'user_ids': user_id,
+            'fields': fields
+        }
+        
+        result = self._request('users.get', params)
+        if result and len(result) > 0:
+            return result[0]
+        return None
+    
+    def search_users(self, query, count=10, fields=None):
+        """Поиск пользователей (только если токен имеет права)"""
+        if fields is None:
+            fields = "first_name,last_name,status,sex,photo_max_orig"
+        
+        params = {
+            'q': query,
+            'count': min(count, 100),
+            'fields': fields
+        }
+        
+        return self._request('users.search', params)
+    
+    def get_friends(self, user_id, count=10):
+        """Получение друзей пользователя"""
+        params = {
+            'user_id': user_id,
+            'count': min(count, 100),
+            'fields': 'first_name,last_name,photo_max_orig'
+        }
+        
+        return self._request('friends.get', params)
+    
+    def get_groups(self, user_id, count=10):
+        """Получение групп пользователя"""
+        params = {
+            'user_id': user_id,
+            'count': min(count, 100),
+            'fields': 'name,photo_200'
+        }
+        
+        return self._request('groups.get', params)
+    
+    def get_wall_posts(self, user_id, count=5):
+        """Получение записей со стены пользователя"""
+        params = {
+            'owner_id': user_id,
+            'count': min(count, 100)
+        }
+        
+        return self._request('wall.get', params)
+    
+    def get_photos(self, user_id, count=5):
+        """Получение фото пользователя"""
+        params = {
+            'owner_id': user_id,
+            'count': min(count, 100),
+            'album_id': 'profile'
+        }
+        
+        return self._request('photos.get', params)
+
+def print_user_info(user):
+    """Красиво выводит информацию о пользователе"""
+    if not user:
+        print("❌ Пользователь не найден")
+        return
+    
+    print("\n" + "="*60)
+    print(f"👤 {user.get('first_name', '')} {user.get('last_name', '')}")
+    print("="*60)
+    print(f"🆔 ID: {user.get('id')}")
+    print(f"♂️ Пол: {'Женский' if user.get('sex') == 1 else 'Мужской' if user.get('sex') == 2 else 'Не указан'}")
+    print(f"🎂 Дата рождения: {user.get('bdate', 'Не указана')}")
+    print(f"🌍 Город: {user.get('city', {}).get('title', 'Не указан')}")
+    print(f"🌍 Страна: {user.get('country', {}).get('title', 'Не указана')}")
+    print(f"📱 Онлайн: {'🟢 Да' if user.get('online') == 1 else '⚫ Нет'}")
+    print(f"📝 Статус: {user.get('status', 'Нет')}")
+    
+    if user.get('last_seen'):
+        import datetime
+        last_seen = datetime.datetime.fromtimestamp(user['last_seen']['time'])
+        print(f"⏰ Последний раз был: {last_seen.strftime('%Y-%m-%d %H:%M:%S')}")
+    
+    if user.get('photo_max_orig'):
+        print(f"🖼️ Фото: {user['photo_max_orig']}")
+    
+    if user.get('about'):
+        print(f"📝 О себе: {user['about']}")
+
+def main():
+    print("="*70)
+    print("🚀 VK API КЛИЕНТ")
+    print(f"👤 Ваш ID: {MY_USER_ID}")
+    print(f"📧 Email: {MY_EMAIL}")
+    print(f"🔑 Токен: {TOKEN[:20]}...{TOKEN[-10:]}")
+    print("="*70)
+    
+    vk = VKAPIClient(TOKEN)
+    
+    while True:
+        print("\n" + "-"*40)
+        print("📌 ДОСТУПНЫЕ ДЕЙСТВИЯ:")
+        print("  1 - Получить информацию о пользователе")
+        print("  2 - Поиск пользователей")
+        print("  3 - Получить друзей")
+        print("  4 - Получить группы")
+        print("  5 - Получить записи со стены")
+        print("  6 - Получить фото")
+        print("  7 - Информация о себе")
+        print("  8 - Тест всех методов (с демо-данными)")
+        print("  9 - Выйти")
+        print("-"*40)
+        
+        choice = input("Выберите действие (1-9): ").strip()
+        
+        if choice == "1":
+            user_id = input("Введите ID пользователя: ").strip()
+            if user_id:
+                user = vk.get_user(user_id)
+                print_user_info(user)
+            else:
+                print("❌ ID не может быть пустым!")
+                
+        elif choice == "2":
+            query = input("Введите запрос для поиска: ").strip()
+            if query:
+                count = input("Количество результатов (по умолчанию 10): ").strip()
+                count = int(count) if count.isdigit() else 10
+                result = vk.search_users(query, count)
+                if result:
+                    items = result.get('items', [])
+                    print(f"\n📊 Найдено: {result.get('count', 0)}")
+                    print(f"📄 Показано: {len(items)}")
+                    for i, user in enumerate(items[:5], 1):
+                        print(f"{i}. {user.get('first_name')} {user.get('last_name')} (ID: {user.get('id')})")
+            else:
+                print("❌ Запрос не может быть пустым!")
+        
+        elif choice == "3":
+            user_id = input("Введите ID пользователя (по умолчанию свой): ").strip()
+            if not user_id:
+                user_id = MY_USER_ID
+            count = input("Количество друзей (по умолчанию 10): ").strip()
+            count = int(count) if count.isdigit() else 10
+            result = vk.get_friends(user_id, count)
+            if result:
+                items = result.get('items', [])
+                print(f"\n👥 Друзей: {result.get('count', 0)}")
+                for i, friend in enumerate(items[:5], 1):
+                    print(f"{i}. {friend.get('first_name')} {friend.get('last_name')}")
+        
+        elif choice == "4":
+            user_id = input("Введите ID пользователя (по умолчанию свой): ").strip()
+            if not user_id:
+                user_id = MY_USER_ID
+            count = input("Количество групп (по умолчанию 10): ").strip()
+            count = int(count) if count.isdigit() else 10
+            result = vk.get_groups(user_id, count)
+            if result:
+                items = result.get('items', [])
+                print(f"\n📚 Групп: {result.get('count', 0)}")
+                for i, group in enumerate(items[:5], 1):
+                    print(f"{i}. {group.get('name', 'Без названия')}")
+        
+        elif choice == "5":
+            user_id = input("Введите ID пользователя (по умолчанию свой): ").strip()
+            if not user_id:
+                user_id = MY_USER_ID
+            count = input("Количество записей (по умолчанию 5): ").strip()
+            count = int(count) if count.isdigit() else 5
+            result = vk.get_wall_posts(user_id, count)
+            if result:
+                items = result.get('items', [])
+                print(f"\n📝 Записей: {result.get('count', 0)}")
+                for i, post in enumerate(items[:3], 1):
+                    text = post.get('text', 'Нет текста')[:100]
+                    print(f"{i}. {text}...")
+                    print(f"   ❤️ {post.get('likes', {}).get('count', 0)} 💬 {post.get('comments', {}).get('count', 0)}")
+        
+        elif choice == "6":
+            user_id = input("Введите ID пользователя (по умолчанию свой): ").strip()
+            if not user_id:
+                user_id = MY_USER_ID
+            count = input("Количество фото (по умолчанию 5): ").strip()
+            count = int(count) if count.isdigit() else 5
+            result = vk.get_photos(user_id, count)
+            if result:
+                items = result.get('items', [])
+                print(f"\n🖼️ Фото: {result.get('count', 0)}")
+                for i, photo in enumerate(items[:3], 1):
+                    sizes = photo.get('sizes', [])
+                    if sizes:
+                        url = sizes[-1].get('url', 'Нет URL')
+                        print(f"{i}. {url[:80]}...")
+        
+        elif choice == "7":
+            user = vk.get_user(MY_USER_ID)
+            print_user_info(user)
+        
+        elif choice == "8":
+            print("\n🔍 ТЕСТИРОВАНИЕ ВСЕХ МЕТОДОВ")
+            print("-"*40)
+            
+            # Тест 1: Информация о себе
+            print("1️⃣ Информация о себе...")
+            me = vk.get_user(MY_USER_ID)
+            if me:
+                print(f"✅ {me.get('first_name')} {me.get('last_name')}")
+            
+            # Тест 2: Информация о пользователе 572263620
+            print("2️⃣ Информация о пользователе 572263620...")
+            user = vk.get_user("572263620")
+            if user:
+                print(f"✅ {user.get('first_name')} {user.get('last_name')}")
+            
+            # Тест 3: Поиск
+            print("3️⃣ Поиск пользователей 'Алексей'...")
+            result = vk.search_users("Алексей", 3)
+            if result:
+                items = result.get('items', [])
+                print(f"✅ Найдено: {len(items)}")
+            
+            print("✅ Тестирование завершено!")
+        
+        elif choice == "9":
+            print("👋 До свидания!")
+            break
+        
+        else:
+            print("❌ Неверный выбор!")
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n\n👋 Программа прервана")
+    except Exception as e:
+        print(f"\n❌ Критическая ошибка: {e}")
+        import traceback
+        traceback.print_exc()
+        
+        
+    
+
+ починить все кнопки, починить чтобы изоображие было всегдав  боте чтобы не слетало при переходе назад.
+ и добавть крутые фишки
+ 

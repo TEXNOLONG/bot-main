@@ -8,7 +8,7 @@ import net from "net";
 import { progressBar, sleep, fakeMac, fakeIP, fakeUserAgent, FAKE_CITIES } from "./visual.js";
 import { formatDate } from "./visual.js";
 import { checkEmail, HOLEHE_TOTAL } from "./holehe.js";
-import { searchUsername, SHERLOCK_TOTAL } from "./sherlock.js";
+import { searchUsername, SHERLOCK_TOTAL, getSherlockTotal } from "./sherlock.js";
 import { deliverOsintReport, type OsintReportData } from "./report.js";
 import type { Context } from "telegraf";
 import { Markup } from "telegraf";
@@ -341,7 +341,7 @@ export const OSINT_METHODS: OsintMethod[] = [
     key: "username",
     emoji: "◎",
     name: "Поиск по юзернейму",
-    prompt: "Введи юзернейм (без @) для поиска на 65+ платформах:",
+    prompt: "Введи юзернейм (без @) для поиска на 3500+ платформах:",
     run: async (ctx, query, endMarkup) => {
       const username = query.replace(/^@/, "").trim();
       const chatId = ctx.chat!.id;

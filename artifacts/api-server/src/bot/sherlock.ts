@@ -1,8 +1,16 @@
 /**
- * sherlock.ts — Username search across 65+ platforms (inspired by sherlock-project/sherlock)
- * Checks profile URLs for existence via HTTP status codes / response body.
+ * sherlock.ts — Username search across 500+ built-in platforms
+ *              + Maigret database (~3500 sites, cached on disk).
+ *
+ * On first run fetches the Maigret data.json from GitHub and caches it
+ * to ./sherlock-cache.json next to snos_data.json. Falls back to built-in
+ * platforms if the fetch fails.
  */
 import fetch from "node-fetch";
+import fs from "fs/promises";
+import path from "path";
+import { fileURLToPath } from "url";
+import { BUILTIN_PLATFORMS, type Platform, type NotFoundStrategy } from "./sherlock-sites.js";
 
 export interface SherlockResult {
   platform: string;
@@ -16,453 +24,167 @@ const UA =
   "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36";
 const TIMEOUT = 7000;
 
-type NotFoundStrategy =
-  | { kind: "status"; code: number }
-  | { kind: "bodyContains"; text: string }
-  | { kind: "redirectTo"; pattern: string };
+// ─── Maigret integration ──────────────────────────────────────────────────────
 
-interface Platform {
-  name: string;
-  category: string;
-  url: (u: string) => string;
-  notFound: NotFoundStrategy;
+const MAIGRET_URL =
+  "https://raw.githubusercontent.com/soxoj/maigret/main/maigret/resources/data.json";
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const CACHE_FILE = path.resolve(__dirname, "../../sherlock-cache.json");
+const CACHE_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
+
+let _merged: Platform[] | null = null;
+
+interface MaigretSite {
+  tags?: string[];
+  disabled?: boolean;
+  data?: {
+    mainUrl?: string;
+    url?: string;
+    urlMain?: string;
+    errorType?: string;
+    errorCode?: number;
+    errorMsg?: string | null;
+    regexCheck?: string;
+  };
 }
 
-const PLATFORMS: Platform[] = [
-  // ─── Social ──────────────────────────────────────────────────────────────
-  {
-    name: "Instagram",
-    category: "Соцсети",
-    url: (u) => `https://www.instagram.com/${u}/`,
-    notFound: { kind: "status", code: 404 },
-  },
-  {
-    name: "Twitter/X",
-    category: "Соцсети",
-    url: (u) => `https://x.com/${u}`,
-    notFound: { kind: "status", code: 404 },
-  },
-  {
-    name: "TikTok",
-    category: "Соцсети",
-    url: (u) => `https://www.tiktok.com/@${u}`,
-    notFound: { kind: "status", code: 404 },
-  },
-  {
-    name: "Pinterest",
-    category: "Соцсети",
-    url: (u) => `https://www.pinterest.com/${u}/`,
-    notFound: { kind: "status", code: 404 },
-  },
-  {
-    name: "Facebook",
-    category: "Соцсети",
-    url: (u) => `https://www.facebook.com/${u}`,
-    notFound: { kind: "status", code: 404 },
-  },
-  {
-    name: "LinkedIn",
-    category: "Соцсети",
-    url: (u) => `https://www.linkedin.com/in/${u}`,
-    notFound: { kind: "status", code: 404 },
-  },
-  {
-    name: "Snapchat",
-    category: "Соцсети",
-    url: (u) => `https://www.snapchat.com/add/${u}`,
-    notFound: { kind: "status", code: 404 },
-  },
-  {
-    name: "VK",
-    category: "Соцсети",
-    url: (u) => `https://vk.com/${u}`,
-    notFound: { kind: "bodyContains", text: "not found" },
-  },
-  {
-    name: "Odnoklassniki",
-    category: "Соцсети",
-    url: (u) => `https://ok.ru/${u}`,
-    notFound: { kind: "status", code: 404 },
-  },
-  {
-    name: "Mastodon",
-    category: "Соцсети",
-    url: (u) => `https://mastodon.social/@${u}`,
-    notFound: { kind: "status", code: 404 },
-  },
-  {
-    name: "Bluesky",
-    category: "Соцсети",
-    url: (u) => `https://bsky.app/profile/${u}`,
-    notFound: { kind: "status", code: 404 },
-  },
-  {
-    name: "Threads",
-    category: "Соцсети",
-    url: (u) => `https://www.threads.net/@${u}`,
-    notFound: { kind: "status", code: 404 },
-  },
+function maigretToPlatform(name: string, site: MaigretSite): Platform | null {
+  try {
+    if (site.disabled) return null;
+    const d = site.data ?? {};
+    const urlTpl = d.url ?? d.mainUrl ?? d.urlMain;
+    if (!urlTpl || !urlTpl.includes("{username}")) return null;
 
-  // ─── Мессенджеры ─────────────────────────────────────────────────────────
-  {
-    name: "Telegram",
-    category: "Мессенджеры",
-    url: (u) => `https://t.me/${u}`,
-    notFound: { kind: "bodyContains", text: "If you have Telegram" },
-  },
+    // Determine notFound strategy
+    let notFound: NotFoundStrategy;
+    if (d.errorType === "status_code") {
+      notFound = { kind: "status", code: d.errorCode ?? 404 };
+    } else if (d.errorType === "message" && d.errorMsg) {
+      notFound = { kind: "bodyContains", text: d.errorMsg };
+    } else if (d.errorType === "response_url" && d.errorMsg) {
+      notFound = { kind: "redirectTo", pattern: d.errorMsg };
+    } else {
+      notFound = { kind: "status", code: 404 };
+    }
 
-  // ─── Форумы ───────────────────────────────────────────────────────────────
-  {
-    name: "Reddit",
-    category: "Форумы",
-    url: (u) => `https://www.reddit.com/user/${u}`,
-    notFound: { kind: "status", code: 404 },
-  },
-  {
-    name: "Quora",
-    category: "Форумы",
-    url: (u) => `https://www.quora.com/profile/${u}`,
-    notFound: { kind: "status", code: 404 },
-  },
-  {
-    name: "HackerNews",
-    category: "Форумы",
-    url: (u) => `https://news.ycombinator.com/user?id=${u}`,
-    notFound: { kind: "bodyContains", text: "No such user" },
-  },
-  {
-    name: "Ask.fm",
-    category: "Форумы",
-    url: (u) => `https://ask.fm/${u}`,
-    notFound: { kind: "status", code: 404 },
-  },
+    // Pick a readable category from tags
+    const tags = site.tags ?? [];
+    const category = categFromTags(tags) ?? "Прочее";
 
-  // ─── Разработка ───────────────────────────────────────────────────────────
-  {
-    name: "GitHub",
-    category: "Разработка",
-    url: (u) => `https://github.com/${u}`,
-    notFound: { kind: "status", code: 404 },
-  },
-  {
-    name: "GitLab",
-    category: "Разработка",
-    url: (u) => `https://gitlab.com/${u}`,
-    notFound: { kind: "status", code: 404 },
-  },
-  {
-    name: "Bitbucket",
-    category: "Разработка",
-    url: (u) => `https://bitbucket.org/${u}`,
-    notFound: { kind: "status", code: 404 },
-  },
-  {
-    name: "Dev.to",
-    category: "Разработка",
-    url: (u) => `https://dev.to/${u}`,
-    notFound: { kind: "status", code: 404 },
-  },
-  {
-    name: "Codepen",
-    category: "Разработка",
-    url: (u) => `https://codepen.io/${u}`,
-    notFound: { kind: "status", code: 404 },
-  },
-  {
-    name: "Replit",
-    category: "Разработка",
-    url: (u) => `https://replit.com/@${u}`,
-    notFound: { kind: "status", code: 404 },
-  },
-  {
-    name: "npm",
-    category: "Разработка",
-    url: (u) => `https://www.npmjs.com/~${u}`,
-    notFound: { kind: "status", code: 404 },
-  },
-  {
-    name: "PyPI",
-    category: "Разработка",
-    url: (u) => `https://pypi.org/user/${u}/`,
-    notFound: { kind: "status", code: 404 },
-  },
-  {
-    name: "Docker Hub",
-    category: "Разработка",
-    url: (u) => `https://hub.docker.com/u/${u}`,
-    notFound: { kind: "status", code: 404 },
-  },
-  {
-    name: "Hashnode",
-    category: "Разработка",
-    url: (u) => `https://hashnode.com/@${u}`,
-    notFound: { kind: "status", code: 404 },
-  },
-  {
-    name: "Keybase",
-    category: "Разработка",
-    url: (u) => `https://keybase.io/${u}`,
-    notFound: { kind: "status", code: 404 },
-  },
+    const urlFn = (u: string) => urlTpl.replace(/\{username\}/g, u);
 
-  // ─── Игры ────────────────────────────────────────────────────────────────
-  {
-    name: "Twitch",
-    category: "Игры",
-    url: (u) => `https://www.twitch.tv/${u}`,
-    notFound: { kind: "status", code: 404 },
-  },
-  {
-    name: "Steam",
-    category: "Игры",
-    url: (u) => `https://steamcommunity.com/id/${u}`,
-    notFound: { kind: "bodyContains", text: "The specified profile could not be found" },
-  },
-  {
-    name: "Roblox",
-    category: "Игры",
-    url: (u) => `https://www.roblox.com/user.aspx?username=${u}`,
-    notFound: { kind: "bodyContains", text: "Page Not Found" },
-  },
-  {
-    name: "Chess.com",
-    category: "Игры",
-    url: (u) => `https://www.chess.com/member/${u}`,
-    notFound: { kind: "status", code: 404 },
-  },
-  {
-    name: "Minecraft",
-    category: "Игры",
-    url: (u) => `https://api.mojang.com/users/profiles/minecraft/${u}`,
-    notFound: { kind: "status", code: 404 },
-  },
-  {
-    name: "Faceit",
-    category: "Игры",
-    url: (u) => `https://www.faceit.com/en/players/${u}`,
-    notFound: { kind: "status", code: 404 },
-  },
+    return { name, category, url: urlFn, notFound };
+  } catch {
+    return null;
+  }
+}
 
-  // ─── Видео ───────────────────────────────────────────────────────────────
-  {
-    name: "YouTube",
-    category: "Видео",
-    url: (u) => `https://www.youtube.com/@${u}`,
-    notFound: { kind: "status", code: 404 },
-  },
-  {
-    name: "Vimeo",
-    category: "Видео",
-    url: (u) => `https://vimeo.com/${u}`,
-    notFound: { kind: "status", code: 404 },
-  },
-  {
-    name: "Dailymotion",
-    category: "Видео",
-    url: (u) => `https://www.dailymotion.com/${u}`,
-    notFound: { kind: "status", code: 404 },
-  },
-  {
-    name: "Rutube",
-    category: "Видео",
-    url: (u) => `https://rutube.ru/channel/${u}/`,
-    notFound: { kind: "status", code: 404 },
-  },
+function categFromTags(tags: string[]): string | null {
+  const map: Record<string, string> = {
+    social:     "Соцсети",
+    gaming:     "Игры",
+    game:       "Игры",
+    photo:      "Фото",
+    video:      "Видео",
+    music:      "Музыка",
+    forum:      "Форумы",
+    blog:       "Блоги",
+    dev:        "Разработка",
+    code:       "Разработка",
+    dating:     "Дейтинг",
+    crypto:     "Крипто",
+    finance:    "Финансы",
+    shopping:   "Магазины",
+    education:  "Образование",
+    sport:      "Спорт",
+    fitness:    "Спорт",
+    travel:     "Путешествия",
+    art:        "Дизайн",
+    design:     "Дизайн",
+    news:       "Новости",
+    messenger:  "Мессенджеры",
+    chat:       "Мессенджеры",
+    food:       "Еда",
+    career:     "Работа",
+    freelance:  "Фриланс",
+    russian:    "Соцсети RU",
+    nsfw:       "18+",
+    adult:      "18+",
+    anime:      "Аниме",
+    streaming:  "Видео",
+    podcast:    "Подкасты",
+    portfolio:  "Портфолио",
+    review:     "Отзывы",
+  };
+  for (const tag of tags) {
+    const key = tag.toLowerCase();
+    if (map[key]) return map[key];
+  }
+  return null;
+}
 
-  // ─── Музыка ──────────────────────────────────────────────────────────────
-  {
-    name: "SoundCloud",
-    category: "Музыка",
-    url: (u) => `https://soundcloud.com/${u}`,
-    notFound: { kind: "status", code: 404 },
-  },
-  {
-    name: "Spotify",
-    category: "Музыка",
-    url: (u) => `https://open.spotify.com/user/${u}`,
-    notFound: { kind: "status", code: 404 },
-  },
-  {
-    name: "Last.fm",
-    category: "Музыка",
-    url: (u) => `https://www.last.fm/user/${u}`,
-    notFound: { kind: "status", code: 404 },
-  },
-  {
-    name: "Mixcloud",
-    category: "Музыка",
-    url: (u) => `https://www.mixcloud.com/${u}/`,
-    notFound: { kind: "status", code: 404 },
-  },
-  {
-    name: "Bandcamp",
-    category: "Музыка",
-    url: (u) => `https://${u}.bandcamp.com`,
-    notFound: { kind: "status", code: 404 },
-  },
+/** Load Maigret database (from cache or network). Returns extra platforms. */
+async function loadMaigretPlatforms(): Promise<Platform[]> {
+  // Try cache first
+  try {
+    const stat = await fs.stat(CACHE_FILE);
+    if (Date.now() - stat.mtimeMs < CACHE_MAX_AGE_MS) {
+      const raw = await fs.readFile(CACHE_FILE, "utf-8");
+      const parsed = JSON.parse(raw) as Record<string, MaigretSite>;
+      return convertMaigret(parsed);
+    }
+  } catch {
+    // cache miss or parse error — fall through to network fetch
+  }
 
-  // ─── Фото ────────────────────────────────────────────────────────────────
-  {
-    name: "Flickr",
-    category: "Фото",
-    url: (u) => `https://www.flickr.com/people/${u}`,
-    notFound: { kind: "status", code: 404 },
-  },
-  {
-    name: "500px",
-    category: "Фото",
-    url: (u) => `https://500px.com/p/${u}`,
-    notFound: { kind: "status", code: 404 },
-  },
-  {
-    name: "Unsplash",
-    category: "Фото",
-    url: (u) => `https://unsplash.com/@${u}`,
-    notFound: { kind: "status", code: 404 },
-  },
-  {
-    name: "VSCO",
-    category: "Фото",
-    url: (u) => `https://vsco.co/${u}/gallery`,
-    notFound: { kind: "status", code: 404 },
-  },
+  // Fetch from GitHub
+  try {
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(), 15000);
+    const res = await fetch(MAIGRET_URL, {
+      signal: ctrl.signal as any,
+      headers: { "User-Agent": UA },
+    });
+    clearTimeout(t);
 
-  // ─── Дизайн / Арт ────────────────────────────────────────────────────────
-  {
-    name: "Behance",
-    category: "Дизайн",
-    url: (u) => `https://www.behance.net/${u}`,
-    notFound: { kind: "status", code: 404 },
-  },
-  {
-    name: "Dribbble",
-    category: "Дизайн",
-    url: (u) => `https://dribbble.com/${u}`,
-    notFound: { kind: "status", code: 404 },
-  },
-  {
-    name: "DeviantArt",
-    category: "Дизайн",
-    url: (u) => `https://www.deviantart.com/${u}`,
-    notFound: { kind: "status", code: 404 },
-  },
-  {
-    name: "ArtStation",
-    category: "Дизайн",
-    url: (u) => `https://www.artstation.com/${u}`,
-    notFound: { kind: "status", code: 404 },
-  },
+    if (!res.ok) return [];
 
-  // ─── Блоги / Письмо ───────────────────────────────────────────────────────
-  {
-    name: "Medium",
-    category: "Блоги",
-    url: (u) => `https://medium.com/@${u}`,
-    notFound: { kind: "status", code: 404 },
-  },
-  {
-    name: "Substack",
-    category: "Блоги",
-    url: (u) => `https://substack.com/@${u}`,
-    notFound: { kind: "status", code: 404 },
-  },
-  {
-    name: "Tumblr",
-    category: "Блоги",
-    url: (u) => `https://${u}.tumblr.com`,
-    notFound: { kind: "status", code: 404 },
-  },
-  {
-    name: "Blogger",
-    category: "Блоги",
-    url: (u) => `https://${u}.blogspot.com`,
-    notFound: { kind: "bodyContains", text: "Sorry, the blog at" },
-  },
-  {
-    name: "Goodreads",
-    category: "Книги",
-    url: (u) => `https://www.goodreads.com/${u}`,
-    notFound: { kind: "status", code: 404 },
-  },
-  {
-    name: "Letterboxd",
-    category: "Кино",
-    url: (u) => `https://letterboxd.com/${u}`,
-    notFound: { kind: "status", code: 404 },
-  },
+    const data = (await res.json()) as Record<string, MaigretSite>;
 
-  // ─── Профессиональное ────────────────────────────────────────────────────
-  {
-    name: "Product Hunt",
-    category: "Стартапы",
-    url: (u) => `https://www.producthunt.com/@${u}`,
-    notFound: { kind: "status", code: 404 },
-  },
-  {
-    name: "AngelList",
-    category: "Стартапы",
-    url: (u) => `https://angel.co/${u}`,
-    notFound: { kind: "status", code: 404 },
-  },
+    // Persist cache
+    try {
+      await fs.writeFile(CACHE_FILE, JSON.stringify(data), "utf-8");
+    } catch {}
 
-  // ─── Коммерция ───────────────────────────────────────────────────────────
-  {
-    name: "Etsy",
-    category: "Магазины",
-    url: (u) => `https://www.etsy.com/shop/${u}`,
-    notFound: { kind: "status", code: 404 },
-  },
-  {
-    name: "Fiverr",
-    category: "Фриланс",
-    url: (u) => `https://www.fiverr.com/${u}`,
-    notFound: { kind: "status", code: 404 },
-  },
-  {
-    name: "Patreon",
-    category: "Донаты",
-    url: (u) => `https://www.patreon.com/${u}`,
-    notFound: { kind: "status", code: 404 },
-  },
-  {
-    name: "Ko-fi",
-    category: "Донаты",
-    url: (u) => `https://ko-fi.com/${u}`,
-    notFound: { kind: "status", code: 404 },
-  },
+    return convertMaigret(data);
+  } catch {
+    return [];
+  }
+}
 
-  // ─── Прочее ──────────────────────────────────────────────────────────────
-  {
-    name: "About.me",
-    category: "Портфолио",
-    url: (u) => `https://about.me/${u}`,
-    notFound: { kind: "status", code: 404 },
-  },
-  {
-    name: "Gravatar",
-    category: "Аватары",
-    url: (u) => `https://gravatar.com/${u}`,
-    notFound: { kind: "status", code: 404 },
-  },
-  {
-    name: "Linktree",
-    category: "Ссылки",
-    url: (u) => `https://linktr.ee/${u}`,
-    notFound: { kind: "status", code: 404 },
-  },
-  {
-    name: "Duolingo",
-    category: "Образование",
-    url: (u) => `https://www.duolingo.com/profile/${u}`,
-    notFound: { kind: "status", code: 404 },
-  },
-  {
-    name: "Strava",
-    category: "Спорт",
-    url: (u) => `https://www.strava.com/athletes/${u}`,
-    notFound: { kind: "status", code: 404 },
-  },
-];
+function convertMaigret(data: Record<string, MaigretSite>): Platform[] {
+  const results: Platform[] = [];
+  for (const [name, site] of Object.entries(data)) {
+    const p = maigretToPlatform(name, site);
+    if (p) results.push(p);
+  }
+  return results;
+}
+
+/** Merge built-in + Maigret, deduplicate by name. */
+async function getMergedPlatforms(): Promise<Platform[]> {
+  if (_merged) return _merged;
+
+  const maigret = await loadMaigretPlatforms();
+
+  // Dedup: built-in takes priority
+  const seen = new Set(BUILTIN_PLATFORMS.map(p => p.name.toLowerCase()));
+  const extra = maigret.filter(p => !seen.has(p.name.toLowerCase()));
+
+  _merged = [...BUILTIN_PLATFORMS, ...extra];
+  return _merged;
+}
 
 // ─── HTTP check ──────────────────────────────────────────────────────────────
 
@@ -514,11 +236,12 @@ export async function searchUsername(
   username: string,
   onProgress?: (done: number, total: number) => void
 ): Promise<SherlockResult[]> {
+  const platforms = await getMergedPlatforms();
   const results: SherlockResult[] = [];
-  const BATCH = 10;
+  const BATCH = 20; // higher concurrency now that we have many more sites
 
-  for (let i = 0; i < PLATFORMS.length; i += BATCH) {
-    const slice = PLATFORMS.slice(i, i + BATCH);
+  for (let i = 0; i < platforms.length; i += BATCH) {
+    const slice = platforms.slice(i, i + BATCH);
     const batch = await Promise.all(
       slice.map(async (p): Promise<SherlockResult> => ({
         platform: p.name,
@@ -528,10 +251,17 @@ export async function searchUsername(
       }))
     );
     results.push(...batch);
-    if (onProgress) onProgress(Math.min(i + BATCH, PLATFORMS.length), PLATFORMS.length);
+    if (onProgress) onProgress(Math.min(i + BATCH, platforms.length), platforms.length);
   }
 
   return results;
 }
 
-export const SHERLOCK_TOTAL = PLATFORMS.length;
+/** Returns current total (may grow after Maigret loads). */
+export async function getSherlockTotal(): Promise<number> {
+  const platforms = await getMergedPlatforms();
+  return platforms.length;
+}
+
+/** Sync approximate total before Maigret loads (for UI labels). */
+export const SHERLOCK_TOTAL = BUILTIN_PLATFORMS.length;
